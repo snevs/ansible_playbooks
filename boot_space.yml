@@ -1,0 +1,115 @@
+---
+## __author__: 'roconsta'
+## __description__: Uses UEK kernel cleanup Python script to clean up unnecessary UEK kernels
+##                  Most suitable for Oracle Enterprise Linux due to the nature of the OS which uses UEK
+
+- hosts: all
+  become: True
+  become_user: root
+  become_method: sudo
+  gather_facts: True
+  #strategy: free
+
+  vars_files: 
+    - vars/vars.yml
+    - vars/vault.yml
+
+  pre_tasks:
+    - name: Compare inventory hostname to target hostname
+      fail: msg="Status=Blocked -- Hostnames do not match"
+      when: inventory_hostname|lower != ansible_hostname|lower and vpn_type == "SSL"
+
+  tasks:
+  - name: Get /boot FS info
+    set_fact:
+       mount_point: "{{ item }}"
+    with_items: "{{ ansible_mounts }}"
+    when: item.mount == "/boot"
+ 
+  - name: Print available space in /boot
+    shell: echo -e {{ (mount_point.size_available /1024**2)|round|int }} MB available in /boot
+    when: mount_point is defined
+
+  - name: Check if UEK cleanup script exists
+    stat: path="/usr/bin/uek-cleanup.py"
+    register: uekscript
+    ignore_errors: True
+
+  - name: Run UEK cleanup script
+    shell: uek-cleanup.py --oldkernels --count=1 -y
+    register: uek_cleanup
+    when: mount_point is defined and 
+          (mount_point.size_total /1024**2)|round|int < 110
+          and uekscript.stat.exists == True
+
+  - name: Run UEK cleanup script from Ansible server
+    script: files/uek-cleanup.py --oldkernels --count=1 -y
+    when: mount_point is defined and
+          (mount_point.size_total /1024**2)|round|int < 110
+          and uekscript.stat.exists == False
+
+  - name: Reload ansible_local
+    setup: filter=ansible_mounts
+
+  - name: Re-check boot space
+    set_fact:
+      mount_point: "{{ item }}"
+    with_items: "{{ ansible_mounts }}"
+    when: item.mount == "/boot" and (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Print new available space in /boot
+    shell: echo -e {{ (mount_point.size_available /1024**2)|round|int }} MB available in /boot
+    when: mount_point is defined and (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Remove other unused kernels
+    shell: |
+            for i in $(rpm -qa kernel-uek | egrep -v "$(uname -r)|kdump")
+                do rpm -ev --nodeps $i
+            done
+    when: mount_point is defined and
+          and (mount_point.size_total /1024**2)|round|int < 110
+          (mount_point.size_available /1024**2)|round|int < 50
+
+  - name: Remove unneeded .img files in /boot
+    shell: |
+            for i in $(find /boot -name "*.img" | grep -v $(uname -r))
+                do mv $i /var/tmp
+            done
+    when: mount_point is defined and
+          and (mount_point.size_total /1024**2)|round|int < 110
+          (mount_point.size_available /1024**2)|round|int < 50
+
+  - name: Check currently running kernel
+    shell: uname -r
+    register: unamer
+    when: (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Find vmlinuz for current kernel
+    stat:
+      path: "/boot/vmlinuz-{{ unamer.stdout }}"
+    register: uname_find
+    when: (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Set the default kernel
+    shell: grubby --set-default /boot/vmlinuz-{{ unamer.stdout }}
+    when: uname_find|succeeded and uname_find.stat.exists == True
+
+  - name: Reload ansible_local
+    setup: filter=ansible_mounts
+
+  - name: Re check boot space
+    set_fact:
+      mount_point: "{{ item }}"
+    with_items: "{{ ansible_mounts }}"
+    when: item.mount == "/boot" and (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Print the new available space in /boot
+    shell: echo -e {{ (mount_point.size_available /1024**2)|round|int }} MB available in /boot
+    when: mount_point is defined and (mount_point.size_total /1024**2)|round|int < 110
+
+  - name: Fail if there's still not enough space in /boot
+    fail: msg="Not enough space in /boot"
+    when: (mount_point.size_available /1024**2)|round|int < 30 and
+          (mount_point.size_total /1024**2)|round|int < 110
+
+##EOF
